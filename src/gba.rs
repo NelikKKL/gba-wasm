@@ -107,6 +107,12 @@ mod tests {
     }
 
     #[test]
+    fn jsmolka_bios_tests_pass() {
+        let g = run_rom(include_bytes!("../tests/roms/bios.gba"));
+        assert_eq!(dark_pixels(&g), PASS_DARK_PIXELS, "bios.gba: r12 = {}", g.cpu.r[12]);
+    }
+
+    #[test]
     fn jsmolka_thumb_tests_pass() {
         let g = run_rom(include_bytes!("../tests/roms/thumb.gba"));
         assert_eq!(dark_pixels(&g), PASS_DARK_PIXELS, "thumb.gba: r7 = {}", g.cpu.r[7]);

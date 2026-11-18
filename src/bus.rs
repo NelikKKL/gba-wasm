@@ -12,6 +12,10 @@ pub struct Bus {
     pub keys: u16,
     /// CPU спит до прерывания (запись в HALTCNT).
     pub halted: bool,
+    /// Сейчас исполняется код внутри BIOS (иначе чтение BIOS защищено).
+    pub in_bios: bool,
+    /// Последний «выбранный» опкод BIOS: его возвращает чтение BIOS из кода игры.
+    pub bios_latch: u32,
 }
 
 fn vram_index(off: usize) -> usize {
@@ -32,6 +36,8 @@ impl Bus {
             rom: Vec::new(),
             keys: 0,
             halted: false,
+            in_bios: false,
+            bios_latch: 0xE129_F000,
         };
         bus.install_stub_bios();
         bus
@@ -41,7 +47,7 @@ impl Bus {
     /// сохраняет регистры и вызывает пользовательский обработчик из 0x03007FFC).
     /// TODO: заменить полноценным HLE.
     fn install_stub_bios(&mut self) {
-        let words: [(usize, u32); 7] = [
+        let words: [(usize, u32); 8] = [
             (0x018, 0xEA00_0042), // b    0x128
             (0x128, 0xE92D_500F), // stmfd sp!, {r0-r3, r12, lr}
             (0x12C, 0xE3A0_0301), // mov  r0, #0x04000000
@@ -49,6 +55,7 @@ impl Bus {
             (0x134, 0xE510_F004), // ldr  pc, [r0, #-4]
             (0x138, 0xE8BD_500F), // ldmfd sp!, {r0-r3, r12, lr}
             (0x13C, 0xE25E_F004), // subs pc, lr, #4
+            (0x144, 0xE55E_C002), // ldrb r12, [lr, #-2] — значение, которое видит игра после возврата из IRQ
         ];
         for (a, w) in words {
             self.bios[a..a + 4].copy_from_slice(&w.to_le_bytes());
@@ -84,7 +91,9 @@ impl Bus {
     pub fn read8(&self, addr: u32) -> u8 {
         let off = (addr & 0x00FF_FFFF) as usize;
         match addr >> 24 {
-            0x00 => self.bios.get(off).copied().unwrap_or(0),
+            0x00 if off >= 0x4000 => 0,
+            0x00 if self.in_bios => self.bios[off],
+            0x00 => (self.bios_latch >> ((off & 3) * 8)) as u8, // защита чтения BIOS
             0x02 => self.ewram[off & 0x3_FFFF],
             0x03 => self.iwram[off & 0x7FFF],
             0x04 => self.read_io(off),

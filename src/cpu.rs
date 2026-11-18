@@ -302,13 +302,19 @@ impl Cpu {
                 return 4;
             }
         }
+        bus.in_bios = self.r[15] < 0x4000;
         if self.thumb() {
             let op = bus.read16(self.r[15]) as u32;
             self.r[15] = self.r[15].wrapping_add(2);
             self.exec_thumb(bus, op)
         } else {
-            let op = bus.read32(self.r[15]);
-            self.r[15] = self.r[15].wrapping_add(4);
+            let addr = self.r[15];
+            let op = bus.read32(addr);
+            self.r[15] = addr.wrapping_add(4);
+            if bus.in_bios {
+                // конвейер: последняя выборка из BIOS — на 8 байт впереди
+                bus.bios_latch = bus.read32(addr.wrapping_add(8));
+            }
             self.exec_arm(bus, op)
         }
     }
@@ -320,6 +326,7 @@ impl Cpu {
 
     /// HLE BIOS. Звуковые функции (0x19-0x2A) пока не реализованы.
     fn swi(&mut self, bus: &mut Bus, n: u32) -> u32 {
+        bus.bios_latch = 0xE3A0_2004; // что видит игра, читая BIOS после SWI
         let (r0, r1, r2, r3) = (self.r[0], self.r[1], self.r[2], self.r[3]);
         match n {
             0x00 => self.soft_reset(bus),
