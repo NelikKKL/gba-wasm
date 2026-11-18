@@ -14,3 +14,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# wasm-opt из wasm-pack (старый binaryen) не разбирает wasm от свежего rustc
+# ("Only 1 table definition allowed in MVP"), поэтому пока отключаем.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
