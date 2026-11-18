@@ -444,7 +444,8 @@ impl Cpu {
 
         let writes = !(8..=11).contains(&opc);
         if s {
-            if rd == 15 && writes {
+            if rd == 15 {
+                // у TSTP/TEQP/CMPP/CMNP результат не пишется, но SPSR -> CPSR
                 let spsr = self.get_spsr();
                 self.set_cpsr(spsr);
             } else {
@@ -847,7 +848,7 @@ impl Cpu {
                 let rd = ((op >> 8) & 7) as usize;
                 let addr = self.r[13].wrapping_add((op & 0xFF) << 2);
                 if op & 0x800 != 0 {
-                    self.r[rd] = bus.read32(addr);
+                    self.r[rd] = bus.read32(addr).rotate_right((addr & 3) * 8);
                     3
                 } else {
                     bus.write32(addr, self.r[rd]);

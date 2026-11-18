@@ -78,3 +78,37 @@ impl Gba {
         self.bus.io[6] = self.vcount as u8;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Экран "All tests passed" содержит ровно 270 тёмных пикселей
+    /// (эталон получен из референсной модели; экран с "Failed test N" даёт другое число).
+    const PASS_DARK_PIXELS: usize = 270;
+
+    fn run_rom(rom: &[u8]) -> Gba {
+        let mut g = Gba::new();
+        g.load_rom(rom).unwrap();
+        for _ in 0..60 {
+            g.run_frame();
+        }
+        g
+    }
+
+    fn dark_pixels(g: &Gba) -> usize {
+        g.fb.chunks(4).filter(|p| p[0] < 128).count()
+    }
+
+    #[test]
+    fn jsmolka_arm_tests_pass() {
+        let g = run_rom(include_bytes!("../tests/roms/arm.gba"));
+        assert_eq!(dark_pixels(&g), PASS_DARK_PIXELS, "arm.gba: r12 = {}", g.cpu.r[12]);
+    }
+
+    #[test]
+    fn jsmolka_thumb_tests_pass() {
+        let g = run_rom(include_bytes!("../tests/roms/thumb.gba"));
+        assert_eq!(dark_pixels(&g), PASS_DARK_PIXELS, "thumb.gba: r7 = {}", g.cpu.r[7]);
+    }
+}
