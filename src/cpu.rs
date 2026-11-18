@@ -5,7 +5,7 @@
 //! для Thumb = r[15] + 2 (адрес инструкции + 4).
 //! Тайминги пока приблизительные (без waitstate'ов памяти).
 
-use crate::bus::Bus;
+use crate::{bios, bus::Bus};
 
 const MODE_USR: u32 = 0x10;
 const MODE_FIQ: u32 = 0x11;
@@ -21,6 +21,9 @@ const FLAG_C: u32 = 1 << 29;
 const FLAG_V: u32 = 1 << 28;
 const FLAG_I: u32 = 1 << 7;
 const FLAG_T: u32 = 1 << 5;
+
+/// Флаги прерываний для BIOS (их выставляет IRQ-обработчик игры).
+const BIOS_IF: u32 = 0x0300_7FF8;
 
 /// Индекс банка: 0 usr/sys, 1 fiq, 2 irq, 3 svc, 4 abt, 5 und.
 fn bank(mode: u32) -> usize {
@@ -110,6 +113,8 @@ pub struct Cpu {
     banked: [[u32; 2]; 6], // r13, r14 для каждого банка
     fiq_hi: [u32; 5],      // r8-r12 режима FIQ
     usr_hi: [u32; 5],      // r8-r12 остальных режимов, пока активен FIQ
+    /// Ожидаемые биты для IntrWait/VBlankIntrWait (0 = не ждём).
+    wait_mask: u16,
 }
 
 impl Cpu {
@@ -121,6 +126,7 @@ impl Cpu {
             banked: [[0; 2]; 6],
             fiq_hi: [0; 5],
             usr_hi: [0; 5],
+            wait_mask: 0,
         };
         c.reset();
         c
@@ -133,6 +139,7 @@ impl Cpu {
         self.banked = [[0; 2]; 6];
         self.fiq_hi = [0; 5];
         self.usr_hi = [0; 5];
+        self.wait_mask = 0;
         self.banked[bank(MODE_IRQ)][0] = 0x0300_7FA0;
         self.banked[bank(MODE_SVC)][0] = 0x0300_7FE0;
         self.r[13] = 0x0300_7F00;
@@ -284,6 +291,17 @@ impl Cpu {
             self.enter_irq();
             return 3;
         }
+        if self.wait_mask != 0 {
+            // IntrWait: ждём, пока обработчик пользователя выставит флаги в [0x03007FF8]
+            let flags = bus.read16(BIOS_IF);
+            if flags & self.wait_mask != 0 {
+                bus.write16(BIOS_IF, flags & !self.wait_mask);
+                self.wait_mask = 0;
+            } else {
+                bus.halted = true;
+                return 4;
+            }
+        }
         if self.thumb() {
             let op = bus.read16(self.r[15]) as u32;
             self.r[15] = self.r[15].wrapping_add(2);
@@ -300,35 +318,64 @@ impl Cpu {
         1
     }
 
-    /// Упрощённый HLE BIOS. TODO: CpuSet, CpuFastSet, LZ77, RegisterRamReset и др.
+    /// HLE BIOS. Звуковые функции (0x19-0x2A) пока не реализованы.
     fn swi(&mut self, bus: &mut Bus, n: u32) -> u32 {
+        let (r0, r1, r2, r3) = (self.r[0], self.r[1], self.r[2], self.r[3]);
         match n {
+            0x00 => self.soft_reset(bus),
+            0x01 => bios::register_ram_reset(bus, r0),
             0x02 | 0x03 => bus.halted = true, // Halt / Stop
-            0x04 | 0x05 => {
-                // IntrWait / VBlankIntrWait (упрощённо): включить нужные IRQ и уснуть
-                let mask = if n == 5 { 1 } else { self.r[1] as u16 };
-                let ie = bus.read16(0x0400_0200);
-                bus.write16(0x0400_0200, ie | mask);
-                bus.write16(0x0400_0208, 1);
-                bus.halted = true;
-            }
+            0x04 => self.intr_wait(bus, r0 != 0, r1 as u16),
+            0x05 => self.intr_wait(bus, true, 1), // VBlankIntrWait
             0x06 | 0x07 => {
-                let (num, den) = if n == 6 {
-                    (self.r[0] as i32, self.r[1] as i32)
-                } else {
-                    (self.r[1] as i32, self.r[0] as i32)
-                };
-                if den != 0 {
-                    let q = num.wrapping_div(den);
-                    self.r[0] = q as u32;
-                    self.r[1] = num.wrapping_rem(den) as u32;
-                    self.r[3] = q.unsigned_abs();
-                }
+                let (num, den) = if n == 6 { (r0 as i32, r1 as i32) } else { (r1 as i32, r0 as i32) };
+                let (q, m, abs) = bios::div(num, den);
+                self.r[0] = q as u32;
+                self.r[1] = m as u32;
+                self.r[3] = abs;
             }
-            0x08 => self.r[0] = (self.r[0] as f64).sqrt() as u32,
-            _ => {}
+            0x08 => self.r[0] = bios::sqrt(r0),
+            0x09 => self.r[0] = bios::arctan(r0 as i16 as i32) as u32,
+            0x0A => self.r[0] = bios::arctan2(r0 as i16 as i32, r1 as i16 as i32),
+            0x0B => bios::cpu_set(bus, r0, r1, r2),
+            0x0C => bios::cpu_fast_set(bus, r0, r1, r2),
+            0x0D => self.r[0] = 0xBAAE_187F, // GetBiosChecksum
+            0x0E => bios::bg_affine_set(bus, r0, r1, r2),
+            0x0F => bios::obj_affine_set(bus, r0, r1, r2, r3),
+            0x10 => bios::bit_unpack(bus, r0, r1, r2),
+            0x11 => bios::lz77(bus, r0, r1, false),
+            0x12 => bios::lz77(bus, r0, r1, true),
+            0x13 => bios::huff_uncomp(bus, r0, r1),
+            0x14 => bios::rl_uncomp(bus, r0, r1, false),
+            0x15 => bios::rl_uncomp(bus, r0, r1, true),
+            0x16 => bios::diff_unfilter(bus, r0, r1, false, false),
+            0x17 => bios::diff_unfilter(bus, r0, r1, false, true),
+            0x18 => bios::diff_unfilter(bus, r0, r1, true, true),
+            _ => {} // TODO: звук (SoundBias, SoundDriver*, MidiKey2Freq)
         }
         3
+    }
+
+    fn soft_reset(&mut self, bus: &mut Bus) {
+        let to_ram = bus.read8(0x0300_7FFA) != 0;
+        bus.iwram[0x7E00..].fill(0);
+        self.reset();
+        if to_ram {
+            self.r[15] = 0x0200_0000;
+        }
+    }
+
+    /// IntrWait: сбрасывает старые флаги (если нужно), включает IE/IME,
+    /// а дальше step() усыпляет CPU, пока в [0x03007FF8] не появится нужный бит.
+    fn intr_wait(&mut self, bus: &mut Bus, discard: bool, mask: u16) {
+        if discard {
+            let f = bus.read16(BIOS_IF);
+            bus.write16(BIOS_IF, f & !mask);
+        }
+        let ie = bus.read16(0x0400_0200);
+        bus.write16(0x0400_0200, ie | mask);
+        bus.write16(0x0400_0208, 1);
+        self.wait_mask = mask;
     }
 
     // ================= ARM =================
@@ -1123,6 +1170,36 @@ mod tests {
         run(&mut cpu, &mut bus, 5);
         assert!(cpu.thumb());
         assert_eq!(cpu.r[1], 10);
+    }
+
+    #[test]
+    fn swi_div_and_cpuset() {
+        let (mut cpu, mut bus) = setup(&[0xEF06_0000, 0xEF0B_0000]); // swi 6; swi 0x0B
+        cpu.r[0] = (-7i32) as u32;
+        cpu.r[1] = 2;
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.r[0] as i32, cpu.r[1] as i32, cpu.r[3]), (-3, -1, 3));
+
+        bus.write32(0x0200_0000, 0xDEAD_BEEF);
+        cpu.r[0] = 0x0200_0000;
+        cpu.r[1] = 0x0200_0100;
+        cpu.r[2] = 1 | (1 << 26); // 1 слово
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!(bus.read32(0x0200_0100), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn vblank_intr_wait_sleeps_until_bios_flag() {
+        let (mut cpu, mut bus) = setup(&[0xEF05_0000, 0xE3A0_1001]); // swi 5; mov r1, #1
+        run(&mut cpu, &mut bus, 2); // swi, затем засыпаем
+        assert!(bus.halted);
+        assert_eq!(cpu.r[1], 0);
+        cpu.cpsr |= FLAG_I; // обработчик не вызываем, проверяем только IntrWait
+        bus.raise_irq(1);
+        bus.write16(BIOS_IF, 1); // как делает IRQ-обработчик игры
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!(cpu.r[1], 1);
+        assert_eq!(bus.read16(BIOS_IF), 0);
     }
 
     #[test]

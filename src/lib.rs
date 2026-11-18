@@ -1,3 +1,4 @@
+mod bios;
 mod bus;
 mod cpu;
 mod gba;
