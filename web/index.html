@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GBA Web</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <section class="console">
+      <div class="bezel"><canvas id="screen" width="240" height="160"></canvas></div>
+      <div class="bar">
+        <label class="btn primary">Открыть ROM<input id="rom" type="file" accept=".gba,.bin" hidden></label>
+        <span id="status">Выберите файл .gba</span>
+      </div>
+    </section>
+
+    <section class="binds">
+      <h2>Управление</h2>
+      <p class="hint">Нажмите на ячейку, затем клавишу или кнопку геймпада. Esc — отмена, Backspace — очистить.</p>
+      <table>
+        <thead><tr><th>Кнопка</th><th>Клавиатура</th><th>Геймпад</th></tr></thead>
+        <tbody id="binds"></tbody>
+      </table>
+      <button id="reset" class="btn">Вернуть стандартные</button>
+    </section>
+  </main>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
