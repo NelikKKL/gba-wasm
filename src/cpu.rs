@@ -115,6 +115,10 @@ pub struct Cpu {
     usr_hi: [u32; 5],      // r8-r12 остальных режимов, пока активен FIQ
     /// Ожидаемые биты для IntrWait/VBlankIntrWait (0 = не ждём).
     wait_mask: u16,
+    /// Конвейер выборки: опкоды инструкций по адресам r15 и r15 + размер.
+    /// Запись в память не меняет уже выбранные опкоды (как на железе).
+    pipe: [u32; 2],
+    needs_refill: bool,
 }
 
 impl Cpu {
@@ -127,6 +131,8 @@ impl Cpu {
             fiq_hi: [0; 5],
             usr_hi: [0; 5],
             wait_mask: 0,
+            pipe: [0; 2],
+            needs_refill: true,
         };
         c.reset();
         c
@@ -140,6 +146,7 @@ impl Cpu {
         self.fiq_hi = [0; 5];
         self.usr_hi = [0; 5];
         self.wait_mask = 0;
+        self.needs_refill = true;
         self.banked[bank(MODE_IRQ)][0] = 0x0300_7FA0;
         self.banked[bank(MODE_SVC)][0] = 0x0300_7FE0;
         self.r[13] = 0x0300_7F00;
@@ -274,6 +281,19 @@ impl Cpu {
         self.r[14] = lr;
         self.cpsr = (self.cpsr & !FLAG_T) | FLAG_I;
         self.r[15] = 0x18;
+        self.needs_refill = true;
+    }
+
+    /// Заново заполняет конвейер с адреса r15 (после перехода, смены режима ARM/Thumb, IRQ).
+    fn refill(&mut self, bus: &mut Bus) {
+        bus.in_bios = self.r[15] < 0x4000;
+        let a = self.r[15];
+        self.pipe = if self.thumb() {
+            [bus.read16(a) as u32, bus.read16(a.wrapping_add(2)) as u32]
+        } else {
+            [bus.read32(a), bus.read32(a.wrapping_add(4))]
+        };
+        self.needs_refill = false;
     }
 
     // ---------- Главный шаг ----------
@@ -303,20 +323,27 @@ impl Cpu {
             }
         }
         bus.in_bios = self.r[15] < 0x4000;
-        if self.thumb() {
-            let op = bus.read16(self.r[15]) as u32;
-            self.r[15] = self.r[15].wrapping_add(2);
-            self.exec_thumb(bus, op)
-        } else {
-            let addr = self.r[15];
-            let op = bus.read32(addr);
-            self.r[15] = addr.wrapping_add(4);
-            if bus.in_bios {
-                // конвейер: последняя выборка из BIOS — на 8 байт впереди
-                bus.bios_latch = bus.read32(addr.wrapping_add(8));
-            }
-            self.exec_arm(bus, op)
+        if self.needs_refill {
+            self.refill(bus);
         }
+        let thumb = self.thumb();
+        let size: u32 = if thumb { 2 } else { 4 };
+        let addr = self.r[15];
+        let op = self.pipe[0];
+        self.pipe[0] = self.pipe[1];
+        self.r[15] = addr.wrapping_add(size);
+        // выборка через одну инструкцию вперёд происходит ДО выполнения текущей
+        let fetch = addr.wrapping_add(2 * size);
+        self.pipe[1] = if thumb { bus.read16(fetch) as u32 } else { bus.read32(fetch) };
+        if bus.in_bios && !thumb {
+            bus.bios_latch = self.pipe[1]; // последняя выборка из BIOS
+        }
+        let seq_pc = self.r[15];
+        let cycles = if thumb { self.exec_thumb(bus, op) } else { self.exec_arm(bus, op) };
+        if self.r[15] != seq_pc || self.thumb() != thumb {
+            self.needs_refill = true; // был переход или смена режима
+        }
+        cycles
     }
 
     fn undefined(&mut self) -> u32 {

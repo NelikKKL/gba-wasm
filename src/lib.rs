@@ -3,6 +3,7 @@ mod bus;
 mod cpu;
 mod gba;
 mod ppu;
+mod save;
 
 use wasm_bindgen::prelude::*;
 
@@ -32,6 +33,20 @@ impl Emulator {
 
     pub fn run_frame(&mut self) {
         self.gba.run_frame();
+    }
+
+    /// Копия сохранения (SRAM/Flash); пустая, если у игры нет сохранений.
+    pub fn save_data(&self) -> Vec<u8> {
+        self.gba.save_data().to_vec()
+    }
+
+    pub fn load_save(&mut self, data: &[u8]) {
+        self.gba.load_save(data);
+    }
+
+    /// true, если сохранение изменилось с прошлого вызова.
+    pub fn save_dirty(&mut self) -> bool {
+        self.gba.take_save_dirty()
     }
 
     pub fn frame_ptr(&self) -> *const u8 {

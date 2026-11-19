@@ -122,14 +122,43 @@ const romInput = document.getElementById('rom');
 const wasm = await init();
 let emu = null, running = false, last = performance.now(), acc = 0;
 
+// ---------- Сохранения (SRAM/Flash) в localStorage ----------
+let saveKey = null, frameCount = 0;
+const toB64 = u8 => {
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+const fromB64 = b64 => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+
+function persistSave() {
+  if (!emu || !saveKey) return;
+  try {
+    const data = emu.save_data();
+    if (data.length) localStorage.setItem(saveKey, toB64(data));
+  } catch (e) { console.warn('save failed', e); }
+}
+function restoreSave() {
+  try {
+    const b64 = localStorage.getItem(saveKey);
+    if (b64) emu.load_save(fromB64(b64));
+  } catch (e) { console.warn('load save failed', e); }
+}
+addEventListener('pagehide', persistSave);
+document.addEventListener('visibilitychange', () => { if (document.hidden) persistSave(); });
+
 romInput.onchange = async () => {
   const file = romInput.files[0];
   if (!file) return;
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
+    persistSave();
     emu?.free();
     emu = new Emulator();
-    statusEl.textContent = emu.load_rom(bytes);
+    const title = emu.load_rom(bytes);
+    saveKey = `gba-save:${title}:${bytes.length}`;
+    restoreSave();
+    statusEl.textContent = title;
     running = true;
     acc = 0;
   } catch (err) {
@@ -165,6 +194,8 @@ function loop(t) {
     ran = true;
   }
   if (ran) draw();
+  // раз в секунду сбрасываем изменённое сохранение в localStorage
+  if (++frameCount % 60 === 0 && emu.save_dirty()) persistSave();
 }
 
 render();

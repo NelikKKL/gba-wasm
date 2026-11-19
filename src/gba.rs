@@ -1,4 +1,4 @@
-use crate::{bus::Bus, cpu::Cpu, ppu};
+use crate::{bus::Bus, cpu::Cpu, ppu::{self, Ppu}, save::Save};
 
 pub const CYCLES_PER_FRAME: u32 = 280_896;
 const CYCLES_PER_LINE: u32 = 1232;
@@ -8,6 +8,7 @@ pub struct Gba {
     pub cpu: Cpu,
     pub bus: Bus,
     pub fb: Vec<u8>,
+    ppu: Ppu,
     line_cycles: u32,
     vcount: u32,
     hblank: bool,
@@ -19,6 +20,7 @@ impl Gba {
             cpu: Cpu::new(),
             bus: Bus::new(),
             fb: vec![0; ppu::W * ppu::H * 4],
+            ppu: Ppu::new(),
             line_cycles: 0,
             vcount: 0,
             hblank: false,
@@ -35,17 +37,31 @@ impl Gba {
             .to_string();
         *self = Gba::new();
         self.bus.rom = rom.to_vec();
+        self.bus.save = Save::new(Save::detect(rom));
         Ok(if title.is_empty() { "(без названия)".into() } else { title })
+    }
+
+    pub fn save_data(&self) -> &[u8] {
+        self.bus.save.data()
+    }
+
+    pub fn load_save(&mut self, data: &[u8]) {
+        self.bus.save.load(data);
+    }
+
+    /// true, если с прошлого вызова сохранение изменилось.
+    pub fn take_save_dirty(&mut self) -> bool {
+        self.bus.save.take_dirty()
     }
 
     pub fn run_frame(&mut self) {
         let mut cycles = 0;
         while cycles < CYCLES_PER_FRAME {
-            let c = self.cpu.step(&mut self.bus);
+            // DMA останавливает CPU на время передачи
+            let c = self.cpu.step(&mut self.bus) + std::mem::take(&mut self.bus.dma_cycles);
             cycles += c;
             self.advance_video(c);
         }
-        ppu::render_frame(&self.bus, &mut self.fb);
     }
 
     /// Минимальный видео-таймер: VCOUNT, DISPSTAT и IRQ VBlank/HBlank/VCount.
@@ -56,16 +72,23 @@ impl Gba {
 
         if !self.hblank && self.line_cycles >= HBLANK_START {
             self.hblank = true;
-            if self.vcount < 160 && dispstat & 0x10 != 0 {
-                self.bus.raise_irq(1 << 1);
+            if self.vcount < 160 {
+                self.ppu.render_line(&mut self.bus, self.vcount as usize, &mut self.fb);
+                self.bus.dma_trigger(2); // HBlank-DMA
+                if dispstat & 0x10 != 0 {
+                    self.bus.raise_irq(1 << 1);
+                }
             }
         }
         if self.line_cycles >= CYCLES_PER_LINE {
             self.line_cycles -= CYCLES_PER_LINE;
             self.hblank = false;
             self.vcount = (self.vcount + 1) % 228;
-            if self.vcount == 160 && dispstat & 0x08 != 0 {
-                self.bus.raise_irq(1 << 0);
+            if self.vcount == 160 {
+                self.bus.dma_trigger(1); // VBlank-DMA
+                if dispstat & 0x08 != 0 {
+                    self.bus.raise_irq(1 << 0);
+                }
             }
             if self.vcount == self.bus.io[5] as u32 && dispstat & 0x20 != 0 {
                 self.bus.raise_irq(1 << 2);
@@ -87,10 +110,10 @@ mod tests {
     /// (эталон получен из референсной модели; экран с "Failed test N" даёт другое число).
     const PASS_DARK_PIXELS: usize = 270;
 
-    fn run_rom(rom: &[u8]) -> Gba {
+    fn run_rom(rom: &[u8], frames: usize) -> Gba {
         let mut g = Gba::new();
         g.load_rom(rom).unwrap();
-        for _ in 0..60 {
+        for _ in 0..frames {
             g.run_frame();
         }
         g
@@ -100,21 +123,71 @@ mod tests {
         g.fb.chunks(4).filter(|p| p[0] < 128).count()
     }
 
+    fn px(g: &Gba, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * ppu::W + x) * 4;
+        [g.fb[i], g.fb[i + 1], g.fb[i + 2]]
+    }
+
+    macro_rules! passes {
+        ($name:ident, $rom:expr, $frames:expr) => {
+            #[test]
+            fn $name() {
+                let g = run_rom(include_bytes!($rom), $frames);
+                assert_eq!(
+                    dark_pixels(&g),
+                    PASS_DARK_PIXELS,
+                    "{}: r12 = {}",
+                    $rom,
+                    g.cpu.r[12]
+                );
+            }
+        };
+    }
+
+    passes!(jsmolka_arm_tests_pass, "../tests/roms/arm.gba", 60);
+    passes!(jsmolka_thumb_tests_pass, "../tests/roms/thumb.gba", 60);
+    passes!(jsmolka_bios_tests_pass, "../tests/roms/bios.gba", 60);
+    passes!(jsmolka_memory_tests_pass, "../tests/roms/memory.gba", 60);
+    passes!(jsmolka_nes_tests_pass, "../tests/roms/nes.gba", 60);
+    passes!(jsmolka_unsafe_tests_pass, "../tests/roms/unsafe.gba", 60);
+    passes!(jsmolka_save_none_pass, "../tests/roms/save_none.gba", 60);
+    passes!(jsmolka_save_sram_pass, "../tests/roms/save_sram.gba", 60);
+    passes!(jsmolka_save_flash64_pass, "../tests/roms/save_flash64.gba", 150);
+    passes!(jsmolka_save_flash128_pass, "../tests/roms/save_flash128.gba", 150);
+
     #[test]
-    fn jsmolka_arm_tests_pass() {
-        let g = run_rom(include_bytes!("../tests/roms/arm.gba"));
-        assert_eq!(dark_pixels(&g), PASS_DARK_PIXELS, "arm.gba: r12 = {}", g.cpu.r[12]);
+    fn ppu_stripes_alternate_tiles() {
+        let g = run_rom(include_bytes!("../tests/roms/ppu_stripes.gba"), 12);
+        assert_eq!(px(&g, 0, 0), [90, 132, 173]);
+        assert_eq!(px(&g, 8, 0), [132, 165, 198]);
+        assert_eq!(px(&g, 16, 0), [90, 132, 173]);
+        assert_eq!(px(&g, 239, 159), [132, 165, 198]);
     }
 
     #[test]
-    fn jsmolka_bios_tests_pass() {
-        let g = run_rom(include_bytes!("../tests/roms/bios.gba"));
-        assert_eq!(dark_pixels(&g), PASS_DARK_PIXELS, "bios.gba: r12 = {}", g.cpu.r[12]);
+    fn ppu_shades_gradient() {
+        let g = run_rom(include_bytes!("../tests/roms/ppu_shades.gba"), 12);
+        assert_eq!(px(&g, 0, 0), [0, 0, 0]);
+        assert_eq!(px(&g, 16, 0), [0, 0, 16]);
+        assert_eq!(px(&g, 100, 0), [0, 0, 99]);
+        assert_eq!(px(&g, 232, 159), [0, 0, 231]);
     }
 
     #[test]
-    fn jsmolka_thumb_tests_pass() {
-        let g = run_rom(include_bytes!("../tests/roms/thumb.gba"));
-        assert_eq!(dark_pixels(&g), PASS_DARK_PIXELS, "thumb.gba: r7 = {}", g.cpu.r[7]);
+    fn ppu_hello_world_text() {
+        let g = run_rom(include_bytes!("../tests/roms/ppu_hello.gba"), 12);
+        let white = g.fb.chunks(4).filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255).count();
+        assert_eq!(white, 209);
+        assert_eq!(px(&g, 0, 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn save_type_detected_and_exported() {
+        let mut g = run_rom(include_bytes!("../tests/roms/save_sram.gba"), 60);
+        assert_eq!(g.save_data().len(), 0x8000);
+        assert!(g.take_save_dirty());
+        assert!(!g.take_save_dirty());
+        let none = run_rom(include_bytes!("../tests/roms/save_none.gba"), 1);
+        assert_eq!(none.save_data().len(), 0);
     }
 }
