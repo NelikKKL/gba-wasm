@@ -1,6 +1,7 @@
 //! Звук: 4 PSG-канала (2 прямоугольных, волновой, шум) и 2 Direct Sound FIFO.
 //! Выход — стерео f32 на 32768 Гц (по сэмплу каждые 512 тактов CPU).
 
+#[allow(dead_code)]
 pub const SAMPLE_RATE: u32 = 32_768;
 const CYCLES_PER_SAMPLE: u32 = 512; // 16 777 216 / 32 768
 const SEQ_CYCLES: u32 = 32_768; // 512 Гц: частота кадрового секвенсора
@@ -284,6 +285,7 @@ impl Apu {
         std::mem::take(&mut self.samples)
     }
 
+    #[cfg(test)]
     pub fn fifo_len(&self, i: usize) -> usize {
         self.fifo[i].count
     }
@@ -599,12 +601,15 @@ mod tests {
             set(&mut io, &mut apu, 0xA0, i); // только 32 влезут
         }
         assert_eq!(apu.fifo_len(0), 32);
-        io[0x83] = 0x00; // FIFO A тактируется таймером 0
+        io[0x83] = 0x40; // FIFO A тактируется таймером 0, FIFO B (пустой) — таймером 1
         for _ in 0..15 {
-            assert_eq!(apu.timer_overflow(0, &io), 0); // 32 -> 17
+            assert_eq!(apu.timer_overflow(0, &io), 0); // 32 -> 17, B не затронут
         }
-        assert_eq!(apu.timer_overflow(0, &io), 1); // 16: просим DMA
-        assert_eq!(apu.timer_overflow(1, &io), 0); // другой таймер не трогает FIFO
+        assert_eq!(apu.timer_overflow(0, &io), 1); // 16: A просит DMA
+        assert_eq!(apu.fifo_len(0), 16);
+        // таймер 1 обслуживает только B: пустой FIFO B просит данные, A не трогается
+        assert_eq!(apu.timer_overflow(1, &io), 2);
+        assert_eq!(apu.fifo_len(0), 16);
     }
 
     #[test]

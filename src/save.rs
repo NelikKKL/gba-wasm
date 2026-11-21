@@ -63,6 +63,7 @@ impl Save {
         SaveKind::None
     }
 
+    #[allow(dead_code)]
     pub fn kind(&self) -> SaveKind {
         self.kind
     }
