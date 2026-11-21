@@ -447,10 +447,20 @@ impl Ppu {
                 _ => continue,
             };
             let (bw, bh) = if double { (w * 2, h * 2) } else { (w, h) };
-            let sy = y.wrapping_sub(a0 & 0xFF) & 0xFF;
-            if sy >= bh {
+            let real_sy = y.wrapping_sub(a0 & 0xFF) & 0xFF;
+            if real_sy >= bh {
                 continue;
             }
+            // мозаика спрайтов (бит 12 attr0; размеры блока — в MOSAIC, биты 8-15)
+            let mosaic = a0 & 0x1000 != 0;
+            let mos = io16(bus, 0x4C) as usize;
+            let (mh, mv) = (((mos >> 8) & 0xF) as i32 + 1, ((mos >> 12) & 0xF) + 1);
+            let sy = if mosaic {
+                let s = (y - y % mv).wrapping_sub(a0 & 0xFF) & 0xFF;
+                if s >= bh { 0 } else { s }
+            } else {
+                real_sy
+            };
             let mut ox = (a1 & 0x1FF) as i32;
             if ox >= 256 {
                 ox -= 512;
@@ -479,6 +489,11 @@ impl Ppu {
                 if screen_x < 0 || screen_x >= W as i32 {
                     continue;
                 }
+                let i_x = if mosaic {
+                    ((screen_x - screen_x % mh) - ox).clamp(0, bw as i32 - 1) as usize
+                } else {
+                    i_x
+                };
                 let (tx, ty) = if affine {
                     let dx = i_x as i32 - (bw / 2) as i32;
                     let dy = sy as i32 - (bh / 2) as i32;
@@ -611,6 +626,25 @@ mod tests {
         let fb = frame(&mut bus);
         assert_eq!(px(&fb, 20, 10), [255, 0, 0, 255]);
         assert_eq!(px(&fb, 21, 10), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn sprite_mosaic_repeats_columns() {
+        let mut bus = Bus::new();
+        reg(&mut bus, 0, 0x1040);
+        reg(&mut bus, 0x4C, 0x1100); // OBJ-мозаика 2x2
+        bus.write16(0x0500_0000 + 0x200 + 2, RED);
+        bus.write16(0x0500_0000 + 0x200 + 4, GREEN);
+        // плитка 0, строка 0: пиксели 0..3 = индексы 1,2,1,2
+        bus.write16(0x0601_0000, 0x2121);
+        bus.write16(0x0700_0000, 10 | 0x1000); // y=10, мозаика
+        bus.write16(0x0700_0002, 20); // x=20, 8x8
+        bus.write16(0x0700_0004, 0);
+        let fb = frame(&mut bus);
+        // без мозаики: 20=красный, 21=зелёный; с мозаикой 2x2 пиксель 21 повторяет 20
+        assert_eq!(px(&fb, 20, 10), [255, 0, 0, 255]);
+        assert_eq!(px(&fb, 21, 10), [255, 0, 0, 255]);
+        assert_eq!(px(&fb, 22, 10), [255, 0, 0, 255]);
     }
 
     #[test]

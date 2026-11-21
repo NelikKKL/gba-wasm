@@ -7,6 +7,8 @@ pub enum SaveKind {
     Sram,
     Flash64,
     Flash128,
+    /// EEPROM живёт в отдельном модуле (`eeprom.rs`); здесь только для детекта.
+    Eeprom,
 }
 
 pub struct Save {
@@ -23,7 +25,7 @@ pub struct Save {
 impl Save {
     pub fn new(kind: SaveKind) -> Self {
         let size = match kind {
-            SaveKind::None => 0,
+            SaveKind::None | SaveKind::Eeprom => 0,
             SaveKind::Sram => 0x8000,
             SaveKind::Flash64 => 0x1_0000,
             SaveKind::Flash128 => 0x2_0000,
@@ -41,12 +43,13 @@ impl Save {
 
     /// Ищет строку библиотеки сохранений в ROM (они лежат по адресам, кратным 4).
     pub fn detect(rom: &[u8]) -> SaveKind {
-        let sigs: [(&[u8], SaveKind); 5] = [
+        let sigs: [(&[u8], SaveKind); 6] = [
             (&b"FLASH1M_V"[..], SaveKind::Flash128),
             (&b"FLASH512_V"[..], SaveKind::Flash64),
             (&b"FLASH_V"[..], SaveKind::Flash64),
             (&b"SRAM_F_V"[..], SaveKind::Sram),
             (&b"SRAM_V"[..], SaveKind::Sram),
+            (&b"EEPROM_V"[..], SaveKind::Eeprom),
         ];
         for (sig, kind) in sigs {
             let mut i = 0;
@@ -79,7 +82,7 @@ impl Save {
 
     pub fn read(&self, addr: u32) -> u8 {
         match self.kind {
-            SaveKind::None => 0xFF,
+            SaveKind::None | SaveKind::Eeprom => 0xFF,
             SaveKind::Sram => self.mem[addr as usize & 0x7FFF],
             _ => {
                 let o = addr as usize & 0xFFFF;
@@ -94,7 +97,7 @@ impl Save {
 
     pub fn write(&mut self, addr: u32, v: u8) {
         match self.kind {
-            SaveKind::None => {}
+            SaveKind::None | SaveKind::Eeprom => {}
             SaveKind::Sram => {
                 self.mem[addr as usize & 0x7FFF] = v;
                 self.dirty = true;
@@ -172,6 +175,9 @@ mod tests {
         let mut rom = vec![0u8; 64];
         rom[8..14].copy_from_slice(b"SRAM_V");
         assert_eq!(Save::detect(&rom), SaveKind::Sram);
+        let mut rom = vec![0u8; 64];
+        rom[4..12].copy_from_slice(b"EEPROM_V");
+        assert_eq!(Save::detect(&rom), SaveKind::Eeprom);
     }
 
     #[test]

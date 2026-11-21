@@ -1,6 +1,8 @@
+mod apu;
 mod bios;
 mod bus;
 mod cpu;
+mod eeprom;
 mod gba;
 mod ppu;
 mod save;
@@ -47,6 +49,11 @@ impl Emulator {
     /// true, если сохранение изменилось с прошлого вызова.
     pub fn save_dirty(&mut self) -> bool {
         self.gba.take_save_dirty()
+    }
+
+    /// Звук с прошлого вызова: стерео f32 (L, R, L, R...), 32768 Гц.
+    pub fn take_audio(&mut self) -> Vec<f32> {
+        self.gba.take_audio()
     }
 
     pub fn frame_ptr(&self) -> *const u8 {

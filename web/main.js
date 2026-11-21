@@ -122,7 +122,37 @@ const romInput = document.getElementById('rom');
 const wasm = await init();
 let emu = null, running = false, last = performance.now(), acc = 0;
 
-// ---------- Сохранения (SRAM/Flash) в localStorage ----------
+// ---------- Звук ----------
+let audioCtx = null, audioNode = null, gainNode = null;
+const volumeEl = document.getElementById('volume');
+let volume = 0.7;
+try { volume = +(localStorage.getItem('gba-volume') ?? 0.7); } catch {}
+volumeEl.value = Math.round(volume * 100);
+volumeEl.oninput = () => {
+  volume = volumeEl.value / 100;
+  if (gainNode) gainNode.gain.value = volume;
+  try { localStorage.setItem('gba-volume', String(volume)); } catch {}
+};
+
+// AudioContext можно создавать только после действия пользователя — вызываем при выборе ROM
+async function initAudio() {
+  try {
+    if (!audioCtx) {
+      audioCtx = new AudioContext({ latencyHint: 'interactive' });
+      await audioCtx.audioWorklet.addModule('audio-worklet.js');
+      audioNode = new AudioWorkletNode(audioCtx, 'gba-audio', { outputChannelCount: [2] });
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = volume;
+      audioNode.connect(gainNode).connect(audioCtx.destination);
+      audioNode.port.onmessage = e => { window.__audioLevel = e.data.rms; };
+    }
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+  } catch (err) {
+    console.warn('звук недоступен', err);
+  }
+}
+
+// ---------- Сохранения (SRAM/Flash/EEPROM) в localStorage ----------
 let saveKey = null, frameCount = 0;
 const toB64 = u8 => {
   let s = '';
@@ -153,6 +183,7 @@ romInput.onchange = async () => {
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
     persistSave();
+    initAudio();
     emu?.free();
     emu = new Emulator();
     const title = emu.load_rom(bytes);
@@ -193,7 +224,11 @@ function loop(t) {
     acc -= FRAME_MS;
     ran = true;
   }
-  if (ran) draw();
+  if (ran) {
+    draw();
+    const pcm = emu.take_audio(); // всегда забираем, чтобы очередь не росла
+    if (audioNode && pcm.length) audioNode.port.postMessage(pcm, [pcm.buffer]);
+  }
   // раз в секунду сбрасываем изменённое сохранение в localStorage
   if (++frameCount % 60 === 0 && emu.save_dirty()) persistSave();
 }

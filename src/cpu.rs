@@ -115,6 +115,8 @@ pub struct Cpu {
     usr_hi: [u32; 5],      // r8-r12 остальных режимов, пока активен FIQ
     /// Ожидаемые биты для IntrWait/VBlankIntrWait (0 = не ждём).
     wait_mask: u16,
+    /// Адрес инструкции после SWI: ожидание действует только на ней, а не в обработчике IRQ.
+    wait_pc: u32,
     /// Конвейер выборки: опкоды инструкций по адресам r15 и r15 + размер.
     /// Запись в память не меняет уже выбранные опкоды (как на железе).
     pipe: [u32; 2],
@@ -131,6 +133,7 @@ impl Cpu {
             fiq_hi: [0; 5],
             usr_hi: [0; 5],
             wait_mask: 0,
+            wait_pc: 0,
             pipe: [0; 2],
             needs_refill: true,
         };
@@ -311,7 +314,7 @@ impl Cpu {
             self.enter_irq();
             return 3;
         }
-        if self.wait_mask != 0 {
+        if self.wait_mask != 0 && self.r[15] == self.wait_pc {
             // IntrWait: ждём, пока обработчик пользователя выставит флаги в [0x03007FF8]
             let flags = bus.read16(BIOS_IF);
             if flags & self.wait_mask != 0 {
@@ -410,6 +413,7 @@ impl Cpu {
         bus.write16(0x0400_0200, ie | mask);
         bus.write16(0x0400_0208, 1);
         self.wait_mask = mask;
+        self.wait_pc = self.r[15];
     }
 
     // ================= ARM =================
@@ -1234,6 +1238,19 @@ mod tests {
         run(&mut cpu, &mut bus, 1);
         assert_eq!(cpu.r[1], 1);
         assert_eq!(bus.read16(BIOS_IF), 0);
+    }
+
+    #[test]
+    fn irq_handler_runs_while_waiting_in_intr_wait() {
+        let (mut cpu, mut bus) = setup(&[0xEF05_0000, 0xE3A0_1001]); // swi 5; mov r1, #1
+        run(&mut cpu, &mut bus, 2); // swi, затем засыпаем в ожидании
+        assert!(bus.halted);
+        bus.raise_irq(1); // VBlank; IME и IE уже включены вызовом IntrWait
+        run(&mut cpu, &mut bus, 1); // вход в IRQ
+        assert_eq!(cpu.r[15], 0x18);
+        run(&mut cpu, &mut bus, 1); // обязан выполниться вектор (b 0x128), а не заснуть снова
+        assert_eq!(cpu.r[15], 0x128);
+        assert_eq!(cpu.r[1], 0);
     }
 
     #[test]

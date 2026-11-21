@@ -1,3 +1,5 @@
+use crate::apu::Apu;
+use crate::eeprom::Eeprom;
 use crate::save::{Save, SaveKind};
 
 /// Карта памяти GBA. Все доступы идут через эту шину.
@@ -22,11 +24,16 @@ pub struct Bus {
     pub affine_dirty: [bool; 2],
     /// Сохранение картриджа (SRAM/Flash).
     pub save: Save,
+    pub eeprom: Eeprom,
+    pub apu: Apu,
     dma_src: [u32; 4],
     dma_dst: [u32; 4],
     dma_cnt: [u32; 4],
     /// Циклы, потраченные DMA с прошлого опроса (CPU на это время стоит).
     pub dma_cycles: u32,
+    tm_counter: [u32; 4],
+    tm_reload: [u16; 4],
+    tm_acc: [u32; 4],
 }
 
 fn vram_index(off: usize) -> usize {
@@ -51,10 +58,15 @@ impl Bus {
             bios_latch: 0xE129_F000,
             affine_dirty: [false; 2],
             save: Save::new(SaveKind::None),
+            eeprom: Eeprom::new(false),
+            apu: Apu::new(),
             dma_src: [0; 4],
             dma_dst: [0; 4],
             dma_cnt: [0; 4],
             dma_cycles: 0,
+            tm_counter: [0; 4],
+            tm_reload: [0; 4],
+            tm_acc: [0; 4],
         };
         // значения регистров после BIOS: единичные матрицы BG2/BG3
         for off in [0x20usize, 0x26, 0x30, 0x36] {
@@ -104,6 +116,10 @@ impl Bus {
             // KEYINPUT: active-low, 0 = нажата
             0x130 => (!self.keys) as u8,
             0x131 => ((!self.keys >> 8) & 0x03) as u8,
+            0x84 => (self.io[0x84] & 0x80) | self.apu.status(),
+            0x90..=0x9F => self.apu.wave_read(&self.io, off),
+            // TMxCNT_L при чтении отдаёт текущее значение счётчика
+            0x100..=0x10F if (off & 3) < 2 => (self.tm_counter[(off - 0x100) / 4] >> (8 * (off & 1))) as u8,
             _ if off < self.io.len() => self.io[off],
             _ => 0,
         }
@@ -178,6 +194,28 @@ impl Bus {
                     self.io[off] = v;
                     self.affine_dirty[1] = true;
                 }
+                // регистры звука (PSG, FIFO, управление)
+                0x60..=0xA7 => {
+                    self.io[off] = v;
+                    self.apu.write(&self.io, off, v);
+                }
+                // таймеры: запись в CNT_L задаёт перезагружаемое значение,
+                // включение (бит 7 CNT_H) загружает его в счётчик
+                0x100..=0x10F => {
+                    let ch = (off - 0x100) / 4;
+                    let was_enabled = self.io[0x102 + ch * 4] & 0x80 != 0;
+                    self.io[off] = v;
+                    match (off - 0x100) % 4 {
+                        0 | 1 => self.tm_reload[ch] = self.io16_raw(0x100 + ch * 4),
+                        2 => {
+                            if v & 0x80 != 0 && !was_enabled {
+                                self.tm_counter[ch] = self.tm_reload[ch] as u32;
+                                self.tm_acc[ch] = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 // старший байт DMAxCNT_H: бит 7 — включение канала
                 0xBB | 0xC7 | 0xD3 | 0xDF => {
                     let ch = (off - 0xB0) / 12;
@@ -197,7 +235,17 @@ impl Bus {
         }
     }
 
+    /// Обращение попадает в окно EEPROM (0x0D...; для ROM > 16 МБ — только последние 256 байт).
+    fn eeprom_hit(&self, addr: u32) -> bool {
+        self.eeprom.present()
+            && addr >> 24 == 0x0D
+            && (self.rom.len() <= 0x0100_0000 || (addr & 0x01FF_FFFF) >= 0x01FF_FF00)
+    }
+
     pub fn read16(&self, addr: u32) -> u16 {
+        if self.eeprom_hit(addr) {
+            return self.eeprom.read_bit();
+        }
         if matches!(addr >> 24, 0x0E | 0x0F) {
             return self.read8(addr) as u16 * 0x0101; // 8-битная шина сохранений
         }
@@ -214,6 +262,10 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, v: u16) {
+        if self.eeprom_hit(addr) {
+            self.eeprom.write_bit((v & 1) as u8);
+            return;
+        }
         if matches!(addr >> 24, 0x0E | 0x0F) {
             // на 8-битную шину уходит один байт, повёрнутый по младшим битам адреса
             self.write8_raw(addr, (v >> ((addr & 1) * 8)) as u8);
@@ -283,12 +335,16 @@ impl Bus {
     fn dma_run(&mut self, ch: usize) {
         let base = 0xB0 + ch * 12;
         let cnth = self.io16_raw(base + 10);
-        let word = cnth & 0x400 != 0;
+        let timing = (cnth >> 12) & 3;
+        // DMA1/DMA2 в режиме «special» — подкачка звуковых FIFO: 4 слова, адрес приёмника фиксирован
+        let fifo = timing == 3 && (ch == 1 || ch == 2);
+        let word = fifo || cnth & 0x400 != 0;
         let step: u32 = if word { 4 } else { 2 };
-        let dest_ctl = (cnth >> 5) & 3;
+        let dest_ctl = if fifo { 2 } else { (cnth >> 5) & 3 };
         let src_ctl = (cnth >> 7) & 3;
         let (mut src, mut dst) = (self.dma_src[ch], self.dma_dst[ch]);
-        let count = self.dma_cnt[ch];
+        let dst_start = dst;
+        let count = if fifo { 4 } else { self.dma_cnt[ch] };
         for _ in 0..count {
             if word {
                 let v = self.read32(src);
@@ -311,8 +367,11 @@ impl Bus {
         self.dma_cycles += 2 * count + 2;
         self.dma_src[ch] = src;
         self.dma_dst[ch] = dst;
+        if self.eeprom_hit(dst_start) {
+            self.eeprom.dma_end(count as usize); // передача в EEPROM закончилась
+        }
 
-        if cnth & 0x200 != 0 && (cnth >> 12) & 3 != 0 {
+        if cnth & 0x200 != 0 && timing != 0 {
             // повтор: счётчик (и адрес назначения при режиме 3) перезагружаются
             self.dma_cnt[ch] = self.dma_count(ch);
             if dest_ctl == 3 {
@@ -323,6 +382,71 @@ impl Bus {
         }
         if cnth & 0x4000 != 0 {
             self.raise_irq(1u16 << (8 + ch));
+        }
+    }
+
+    /// Звуковому FIFO нужны данные: запускаем DMA1/DMA2, который пишет в его регистр.
+    fn dma_fifo(&mut self, fifo: usize) {
+        let addr = 0x0400_00A0 + 4 * fifo as u32;
+        for ch in 1..3 {
+            let cnth = self.io16_raw(0xB0 + ch * 12 + 10);
+            if cnth & 0x8000 != 0 && (cnth >> 12) & 3 == 3 && self.dma_dst[ch] & 0x0FFF_FFFC == addr {
+                self.dma_run(ch);
+            }
+        }
+    }
+
+    // ---------- Таймеры и звук ----------
+
+    /// Продвигает таймеры и APU на `cycles` тактов CPU.
+    pub fn tick(&mut self, cycles: u32) {
+        for ch in 0..4 {
+            let ctrl = self.io[0x102 + ch * 4];
+            if ctrl & 0x80 == 0 || (ctrl & 4 != 0 && ch > 0) {
+                continue; // выключен или считает по переполнению соседа
+            }
+            let shift = [0u32, 6, 8, 10][(ctrl & 3) as usize];
+            self.tm_acc[ch] += cycles;
+            let ticks = self.tm_acc[ch] >> shift;
+            self.tm_acc[ch] &= (1 << shift) - 1;
+            if ticks > 0 {
+                self.timer_advance(ch, ticks);
+            }
+        }
+        self.apu.advance(cycles, &self.io);
+    }
+
+    fn timer_advance(&mut self, ch: usize, mut ticks: u32) {
+        while ticks > 0 {
+            let remaining = 0x1_0000 - self.tm_counter[ch];
+            if ticks < remaining {
+                self.tm_counter[ch] += ticks;
+                break;
+            }
+            ticks -= remaining;
+            self.tm_counter[ch] = self.tm_reload[ch] as u32;
+            self.timer_overflow(ch);
+        }
+    }
+
+    fn timer_overflow(&mut self, ch: usize) {
+        let ctrl = self.io[0x102 + ch * 4];
+        if ctrl & 0x40 != 0 {
+            self.raise_irq(1u16 << (3 + ch));
+        }
+        if ch < 2 {
+            let need = self.apu.timer_overflow(ch, &self.io);
+            for f in 0..2 {
+                if need & (1 << f) != 0 {
+                    self.dma_fifo(f);
+                }
+            }
+        }
+        if ch < 3 {
+            let next = self.io[0x102 + (ch + 1) * 4];
+            if next & 0x80 != 0 && next & 4 != 0 {
+                self.timer_advance(ch + 1, 1);
+            }
         }
     }
 }
@@ -395,6 +519,64 @@ mod tests {
         b.dma_trigger(2);
         assert_eq!(b.read32(0x0200_0200), 0x1122_3344);
         assert_ne!(b.io[0xBB] & 0x80, 0);
+    }
+
+    #[test]
+    fn timer_counts_prescales_and_cascades() {
+        let mut b = Bus::new();
+        b.write16(0x0400_0100, 0xFFFE); // TM0: переполнение через 2 такта
+        b.write16(0x0400_0102, 0x00C0); // включён, IRQ, делитель 1
+        b.write16(0x0400_0104, 0xFFFF); // TM1: перезагрузка 0xFFFF
+        b.write16(0x0400_0106, 0x00C4); // включён, IRQ, каскад от TM0
+        b.tick(1);
+        assert_eq!(b.read16(0x0400_0100), 0xFFFF);
+        b.tick(1); // TM0 переполняется -> IRQ, TM1 получает +1 и тоже переполняется
+        assert_eq!(b.read16(0x0400_0202) & 0x18, 0x18);
+        assert_eq!(b.read16(0x0400_0100), 0xFFFE); // перезагрузился
+        assert_eq!(b.read16(0x0400_0104), 0xFFFF);
+
+        // делитель 64
+        b.write16(0x0400_0108, 0x0000);
+        b.write16(0x0400_010A, 0x0081);
+        b.tick(63);
+        assert_eq!(b.read16(0x0400_0108), 0);
+        b.tick(1);
+        assert_eq!(b.read16(0x0400_0108), 1);
+    }
+
+    #[test]
+    fn sound_fifo_dma_refills_on_timer_overflow() {
+        let mut b = Bus::new();
+        for i in 0..16u32 {
+            b.write32(0x0200_0000 + i * 4, 0x4040_4040);
+        }
+        b.write16(0x0400_0084, 0x0080); // звук включён
+        b.write16(0x0400_0082, 0x0304); // FIFO A: 100%, L+R, таймер 0
+        b.write16(0x0400_0100, 0xFFF0); // TM0: переполнение через 16 тактов
+        b.write16(0x0400_0102, 0x0080);
+        b.write32(0x0400_00BC, 0x0200_0000); // DMA1: источник
+        b.write32(0x0400_00C0, 0x0400_00A0); // приёмник = FIFO A
+        b.write32(0x0400_00C4, 4 | (0xB640 << 16)); // special, повтор, 32 бита, приёмник фиксирован
+        assert_eq!(b.apu.fifo_len(0), 0);
+        b.tick(16);
+        assert_eq!(b.apu.fifo_len(0), 16); // DMA подкачал 4 слова
+        assert_eq!(b.dma_src[1], 0x0200_0010);
+        for _ in 0..3 {
+            b.tick(16);
+        }
+        assert!(b.apu.fifo_len(0) > 16);
+    }
+
+    #[test]
+    fn eeprom_window_and_rom_size_rule() {
+        let mut b = Bus::new();
+        b.eeprom = Eeprom::new(true);
+        b.rom = vec![0; 0x100];
+        assert!(b.eeprom_hit(0x0D00_0000)); // ROM <= 16 МБ: всё окно
+        assert_eq!(b.read16(0x0D00_0000), 1); // готов
+        b.rom = vec![0; 0x0200_0000];
+        assert!(!b.eeprom_hit(0x0D00_0000)); // ROM 32 МБ: только последние 256 байт
+        assert!(b.eeprom_hit(0x0DFF_FF00));
     }
 
     #[test]

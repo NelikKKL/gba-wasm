@@ -1,4 +1,10 @@
-use crate::{bus::Bus, cpu::Cpu, ppu::{self, Ppu}, save::Save};
+use crate::{
+    bus::Bus,
+    cpu::Cpu,
+    eeprom::Eeprom,
+    ppu::{self, Ppu},
+    save::{Save, SaveKind},
+};
 
 pub const CYCLES_PER_FRAME: u32 = 280_896;
 const CYCLES_PER_LINE: u32 = 1232;
@@ -37,21 +43,32 @@ impl Gba {
             .to_string();
         *self = Gba::new();
         self.bus.rom = rom.to_vec();
-        self.bus.save = Save::new(Save::detect(rom));
+        let kind = Save::detect(rom);
+        self.bus.eeprom = Eeprom::new(kind == SaveKind::Eeprom);
+        self.bus.save = Save::new(if kind == SaveKind::Eeprom { SaveKind::None } else { kind });
         Ok(if title.is_empty() { "(без названия)".into() } else { title })
     }
 
     pub fn save_data(&self) -> &[u8] {
-        self.bus.save.data()
+        if self.bus.eeprom.present() { self.bus.eeprom.data() } else { self.bus.save.data() }
     }
 
     pub fn load_save(&mut self, data: &[u8]) {
-        self.bus.save.load(data);
+        if self.bus.eeprom.present() {
+            self.bus.eeprom.load(data);
+        } else {
+            self.bus.save.load(data);
+        }
     }
 
     /// true, если с прошлого вызова сохранение изменилось.
     pub fn take_save_dirty(&mut self) -> bool {
-        self.bus.save.take_dirty()
+        if self.bus.eeprom.present() { self.bus.eeprom.take_dirty() } else { self.bus.save.take_dirty() }
+    }
+
+    /// Звук, накопленный с прошлого вызова: стерео f32, чередование L, R, 32768 Гц.
+    pub fn take_audio(&mut self) -> Vec<f32> {
+        self.bus.apu.take_samples()
     }
 
     pub fn run_frame(&mut self) {
@@ -60,6 +77,7 @@ impl Gba {
             // DMA останавливает CPU на время передачи
             let c = self.cpu.step(&mut self.bus) + std::mem::take(&mut self.bus.dma_cycles);
             cycles += c;
+            self.bus.tick(c); // таймеры и звук
             self.advance_video(c);
         }
     }
@@ -179,6 +197,31 @@ mod tests {
         let white = g.fb.chunks(4).filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255).count();
         assert_eq!(white, 209);
         assert_eq!(px(&g, 0, 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn psg_square_rom_makes_sound_and_silent_rom_does_not() {
+        let mut g = run_rom(include_bytes!("../tests/roms/psg_square.gba"), 10);
+        let a = g.take_audio();
+        assert!(a.len() > 2000, "len = {}", a.len());
+        let peak = a.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!(peak > 0.05, "peak = {peak}");
+
+        let mut quiet = run_rom(include_bytes!("../tests/roms/arm.gba"), 10);
+        assert!(quiet.take_audio().iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn eeprom_rom_detected() {
+        // сигнатура EEPROM_V в ROM включает окно EEPROM и пустое сохранение до первого обращения
+        let mut rom = vec![0u8; 0x400];
+        rom[0x100..0x108].copy_from_slice(b"EEPROM_V");
+        let mut g = Gba::new();
+        g.load_rom(&rom).unwrap();
+        assert!(g.bus.eeprom.present());
+        assert_eq!(g.save_data().len(), 0);
+        g.load_save(&[0x12; 512]);
+        assert_eq!(g.save_data().len(), 512);
     }
 
     #[test]
